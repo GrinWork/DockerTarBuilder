@@ -7,55 +7,135 @@ on:
         description: '请填写docker镜像名称，多个用英文逗号分开'
         required: true
         default: 'alpine:latest,alpine/curl,busybox:stable-glibc'
+      timezone:
+        description: '时区 (如: Asia/Shanghai, UTC)'
+        required: false
+        default: 'UTC'
+
+env:
+  # 使用唯一的时间戳作为tag，避免重复
+  RELEASE_TAG: DockerTarBuilder-ARM64-${{ github.run_number }}
 
 jobs:
   pull_and_package:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write  # 明确声明需要写权限
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        # 使用Buildx获得更好的多平台支持
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ hashFiles('**/docker-images.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+        # 添加缓存加速后续运行
+
+      - name: Validate input
+        run: |
+          # 验证输入非空
+          if [ -z "${{ github.event.inputs.docker_images }}" ]; then
+            echo "::error::docker_images输入不能为空"
+            exit 1
+          fi
+          echo "✅ 输入验证通过"
+
       - name: Pull Docker Images and Package
         run: |
+          # 启用错误处理，任何命令失败立即退出
+          set -e
+          
           images="${{ github.event.inputs.docker_images }}"
           IFS=',' read -r -a image_array <<< "$images"
+          
+          # 创建输出目录
+          mkdir -p ${{ github.workspace }}/releases
+          
           for image in "${image_array[@]}"; do
-            docker pull "${image}" --platform "linux/arm64"
-            image_name="${image//\//_}"
-            image_name="${image_name//:/_}"
-            docker save "${image}" -o "${image_name}-arm64.tar"
-            gzip -c "${image_name}-arm64.tar" > "${image_name}-arm64.tar.gz"
-            rm "${image_name}-arm64.tar"
+            # 去除首尾空格
+            image=$(echo "$image" | xargs)
+            
+            echo "处理镜像: $image"
+            
+            # 拉取ARM64镜像，失败时重试1次
+            docker pull --platform linux/arm64 "$image" || \
+              (echo "重试拉取 $image..." && sleep 5 && docker pull --platform linux/arm64 "$image")
+            
+            # 生成唯一文件名，使用base64编码避免冲突（问题5）
+            safe_name=$(echo -n "$image" | base64 -w0 | tr '+/' '-_')
+            output_name="${safe_name}-arm64"
+            
+            # 保存并压缩镜像
+            docker save "$image" | gzip > "${{ github.workspace }}/releases/${output_name}.tar.gz"
+            
+            # 生成校验和
+            sha256sum "${{ github.workspace }}/releases/${output_name}.tar.gz" > "${{ github.workspace }}/releases/${output_name}.tar.gz.sha256"
+            
+            echo "✅ 完成: ${image} -> ${output_name}.tar.gz"
           done
 
-      - name: List generated files (debug step)
+      - name: Generate Release Info
         run: |
-          echo "Preparing docker images list (.tar.gz) files:"
-          find $GITHUB_WORKSPACE -name "*.tar.gz"
-          release_name=$(TZ="Asia/Shanghai" date +'%Y-%m-%d %H:%M Build')
+          # 获取时区输入
+          TZ="${{ github.event.inputs.timezone }}" 
+          release_name=$(TZ="$TZ" date +'%Y-%m-%d_%H-%M Build')
           echo "RELEASE_NAME=$release_name" >> $GITHUB_ENV
+          
+          # 生成镜像清单
+          echo "### 包含的镜像" > release_notes.md
+          echo "| 原始镜像 | 文件名 |" >> release_notes.md
+          echo "|----------|--------|" >> release_notes.md
+          for file in ${{ github.workspace }}/releases/*.tar.gz; do
+            if [ -f "$file" ]; then
+              # 从文件名还原镜像名
+              basename=$(basename "$file" .tar.gz)
+              original_name=$(echo -n "$basename" | base64 -d 2>/dev/null || echo "$basename")
+              echo "| \`${original_name%-arm64}\` | \`$(basename "$file")\` |" >> release_notes.md
+            fi
+          done
+          
+          # 添加使用说明
+          cat >> release_notes.md << 'EOF'
+          
+          ## 使用方法
+          \`\`\`bash
+          # 加载镜像
+          docker load -i 文件名.tar.gz
+          
+          # 验证校验和
+          sha256sum -c 文件名.tar.gz.sha256
+          \`\`\`
+          
+          ## 视频教程
+          [![Bilibili](https://img.shields.io/badge/Bilibili-观看教程-00A1D6?logo=bilibili&logoColor=white)](https://www.bilibili.com/video/BV1yyq6YREdF)
+          EOF
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@master
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2.1.0  # 使用固定版本（问题3）
         with:
-          tag_name: DockerTarBuilder-ARM64
+          tag_name: ${{ env.RELEASE_TAG }}  # 唯一tag（问题1）
           name: ${{ env.RELEASE_NAME }} for ARM64
-          body: |
-            [![Github](https://img.shields.io/badge/RELEASE:DockerTarBuilder-123456?logo=github&logoColor=fff&labelColor=green&style=for-the-badge)](https://www.bilibili.com/video/BV1EZ421M7mL) [![Github](https://img.shields.io/badge/国内加速站下载-FC7C0D?logo=github&logoColor=fff&labelColor=000&style=for-the-badge)](https://wkdaily.cpolar.top/archives/1)
-            ### How to use? For example
-            `docker load -i alpine_latest.tar.gz `
-            ### Video teaching
-            [![Bilibili](https://img.shields.io/badge/Bilibili-123456?logo=bilibili&logoColor=fff&labelColor=fb7299)](https://www.bilibili.com/video/BV1yyq6YREdF)
+          body_path: release_notes.md  # 从文件读取说明
+          files: |
+            ${{ github.workspace }}/releases/*.tar.gz
+            ${{ github.workspace }}/releases/*.sha256
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Docker images as release assets
-        uses: softprops/action-gh-release@v2.1.0
-        with:
-          tag_name: DockerTarBuilder-ARM64
-          files: ${{ github.workspace }}/*.tar.gz
+          # 如果tag已存在则追加资源（问题2）
+          tag_exists: true
+          # 明确token
           token: ${{ secrets.GITHUB_TOKEN }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cleanup
+        if: always()
+        run: |
+          # 清理Docker系统，避免缓存过大
+          docker system prune -af --volumes
